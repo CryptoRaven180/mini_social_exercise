@@ -1,4 +1,4 @@
-from flask import Flask, render_template, request, redirect, url_for, session, flash, g
+from flask import Flask, render_template, request, redirect, url_for, session, flash, g, abort
 from werkzeug.security import generate_password_hash, check_password_hash
 from cryptography.fernet import Fernet
 import collections
@@ -95,6 +95,301 @@ REACTION_EMOJIS = {
 REACTION_TYPES = list(REACTION_EMOJIS.keys())
 
 
+# ----- New feature: schema initialization (tier system & daily prompt)
+# Monthly badge counts (Implementations A & B) and the daily invite system
+# (Implementation C) need a few extra columns/tables. This migration is
+# idempotent and runs once at startup (see '__main__' at the end of the file).
+def init_db_schema():
+    """Adds indexes and tables/columns required by the monthly tier system
+    (Implementations A & B) and the daily invite system (Implementation C)."""
+    db = get_db()
+    try:
+        with db:
+            # Speed up the monthly comment/reaction counts
+            db.execute(
+                'CREATE INDEX IF NOT EXISTS idx_comments_user_date'
+                ' ON comments(user_id, created_at)'
+            )
+            # The reactions table ships without a created_at column: add it so
+            # reactions can be counted per month backfilled for existing rows.
+            cursor = db.execute('PRAGMA table_info(reactions)')
+            columns = [column[1] for column in cursor.fetchall()]
+            if 'created_at' not in columns:
+                db.execute(
+                    'ALTER TABLE reactions ADD COLUMN created_at TIMESTAMP'
+                )
+            db.execute(
+                'UPDATE reactions SET created_at = CURRENT_TIMESTAMP'
+                ' WHERE created_at IS NULL'
+            )
+            db.execute(
+                'CREATE INDEX IF NOT EXISTS idx_reactions_user_date'
+                ' ON reactions(user_id, created_at)'
+            )
+            db.execute(
+                '''
+                CREATE TABLE IF NOT EXISTS daily_invites (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    invite_date TEXT NOT NULL UNIQUE,
+                    status TEXT DEFAULT 'pending',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY(user_id) REFERENCES users(id)
+                )
+                '''
+            )
+            cursor = db.execute('PRAGMA table_info(posts)')
+            columns = [column[1] for column in cursor.fetchall()]
+            if 'is_pinned' not in columns:
+                db.execute(
+                    'ALTER TABLE posts ADD COLUMN is_pinned INTEGER DEFAULT 0'
+                )
+            if 'is_daily_prompt' not in columns:
+                db.execute(
+                    'ALTER TABLE posts ADD COLUMN is_daily_prompt'
+                    ' INTEGER DEFAULT 0'
+                )
+    except sqlite3.Error as e:
+        print(f'Schema initialization error: {e}')
+
+
+# ----- New feature (Implementation A): monthly participation tiers
+# Every user starts at the Base level (no badge shown). The Silver level is
+# reached with at least 50 comments AND 100 reactions within the calendar
+# month, the Gold level with at least 100 comments AND 200 reactions. Gold
+# replaces Silver, and both conditions must be met (e.g. 100 comments with
+# only 80 reactions is not enough for Silver).
+MONTHLY_TIERS = [
+    {'name': 'Gold', 'emoji': '🥇', 'comments': 100, 'reactions': 200},
+    {'name': 'Silver', 'emoji': '🥈', 'comments': 50, 'reactions': 100},
+]
+
+# All tier datetime boundaries are expressed in UTC so they match the
+# CURRENT_TIMESTAMP timestamps written by SQLite.
+def badge_for_counts(comments_count, reactions_count):
+    """Maps monthly comment/reaction counts to (badge emoji, level name)."""
+    for tier in MONTHLY_TIERS:
+        if (comments_count >= tier['comments']
+                and reactions_count >= tier['reactions']):
+            return tier['emoji'], tier['name']
+    return '', 'Base'
+
+
+def get_user_badge(user_id):
+    """Computes a user's active tier for the current calendar month.
+
+    Counts are evaluated dynamically, so a level appears as soon as it is
+    reached and is implicitly reset when a new month begins (Implementation B).
+
+    Returns:
+        A tuple (badge emoji, level name, monthly comments, monthly reactions).
+    """
+    if not user_id:
+        return '', 'Base', 0, 0
+
+    month_start = datetime.utcnow().strftime('%Y-%m') + '-01 00:00:00'
+    comments_res = query_db(
+        'SELECT COUNT(*) as cnt FROM comments WHERE user_id = ?'
+        ' AND created_at >= ?',
+        (user_id, month_start),
+        one=True,
+    )
+    reactions_res = query_db(
+        'SELECT COUNT(*) as cnt FROM reactions WHERE user_id = ?'
+        ' AND created_at >= ?',
+        (user_id, month_start),
+        one=True,
+    )
+    comments_count = comments_res['cnt'] if comments_res else 0
+    reactions_count = reactions_res['cnt'] if reactions_res else 0
+
+    badge, level_name = badge_for_counts(comments_count, reactions_count)
+    return badge, level_name, comments_count, reactions_count
+
+
+def get_badges_for_users(user_ids):
+    """Batched variant of get_user_badge for a set of users.
+
+    The feed calls this once for all visible comment authors instead of
+    running two COUNT queries per comment (which would be an N+1 pattern).
+
+    Returns:
+        A dict mapping user_id to the badge emoji ('' for Base users).
+    """
+    badges = {}
+    if not user_ids:
+        return badges
+
+    month_start = datetime.utcnow().strftime('%Y-%m') + '-01 00:00:00'
+    placeholders = ', '.join('?' * len(user_ids))
+    comment_counts = query_db(
+        f'SELECT user_id, COUNT(*) as cnt FROM comments'
+        f' WHERE user_id IN ({placeholders}) AND created_at >= ?'
+        ' GROUP BY user_id',
+        tuple(user_ids) + (month_start,),
+    )
+    reaction_counts = query_db(
+        f'SELECT user_id, COUNT(*) as cnt FROM reactions'
+        f' WHERE user_id IN ({placeholders}) AND created_at >= ?'
+        ' GROUP BY user_id',
+        tuple(user_ids) + (month_start,),
+    )
+    comments_by_user = (
+        {row['user_id']: row['cnt'] for row in comment_counts}
+        if comment_counts else {}
+    )
+    reactions_by_user = (
+        {row['user_id']: row['cnt'] for row in reaction_counts}
+        if reaction_counts else {}
+    )
+    for user_id in user_ids:
+        badge, _ = badge_for_counts(
+            comments_by_user.get(user_id, 0), reactions_by_user.get(user_id, 0)
+        )
+        badges[user_id] = badge
+    return badges
+
+
+# ----- New feature (Implementation B): previous month summary
+# The monthly reset needs no explicit counter table: since all level counts
+# are computed within the current-month window, they zero out automatically
+# when a new month begins. The summary below provides the visual report of
+# the month that just ended, shown the first time the user visits the feed.
+def get_previous_month_summary(user_id):
+    """Computes the counts and level a user reached in the previous month.
+
+    Returns:
+        None if there is no logged-in user, otherwise a dict with the monthly
+        comment/reaction counts, the reached level and its badge emoji.
+    """
+    if not user_id:
+        return None
+
+    now = datetime.utcnow()
+    this_month_start = now.strftime('%Y-%m') + '-01 00:00:00'
+    if now.month == 1:
+        prev_month = datetime(now.year - 1, 12, 1)
+    else:
+        prev_month = datetime(now.year, now.month - 1, 1)
+    prev_month_start = prev_month.strftime('%Y-%m-%d 00:00:00')
+
+    comments_res = query_db(
+        'SELECT COUNT(*) as cnt FROM comments WHERE user_id = ?'
+        ' AND created_at >= ? AND created_at < ?',
+        (user_id, prev_month_start, this_month_start),
+        one=True,
+    )
+    reactions_res = query_db(
+        'SELECT COUNT(*) as cnt FROM reactions WHERE user_id = ?'
+        ' AND created_at >= ? AND created_at < ?',
+        (user_id, prev_month_start, this_month_start),
+        one=True,
+    )
+    comments_count = comments_res['cnt'] if comments_res else 0
+    reactions_count = reactions_res['cnt'] if reactions_res else 0
+
+    badge, level_name = badge_for_counts(comments_count, reactions_count)
+    return {
+        'comments': comments_count,
+        'reactions': reactions_count,
+        'level': level_name,
+        'badge': badge,
+        'month': prev_month.strftime('%B %Y'),
+    }
+
+
+# ----- New feature (Implementation C): daily question/comment invite
+# Once a day the system automatically picks one user and asks them (through a
+# private banner, seen only by them) to start the discussion of the day. The
+# invite has a positive, non-binding tone: the user can decline without
+# giving a reason and with no penalty affecting profile, level or future
+# selection chances (selection randomly excludes users invited in the last
+# 30 days). The daily_invites table holds a single row per day thanks to the
+# UNIQUE constraint on invite_date, which also guards against concurrent
+# requests racing to insert the day's invite.
+def get_daily_invite_status(current_user_id):
+    """Ensures the day's invite exists and reports whether the current user
+    is the one invited.
+
+    Returns:
+        A tuple (show_daily_invite, _) - the second element is kept for
+        future extensions (e.g. a persistent notification list).
+    """
+    today_str = datetime.utcnow().strftime('%Y-%m-%d')
+
+    accepted = query_db(
+        "SELECT id FROM daily_invites WHERE invite_date = ?"
+        " AND status = 'accepted'",
+        (today_str,),
+        one=True,
+    )
+    if accepted:
+        return False, False
+
+    pending = query_db(
+        "SELECT * FROM daily_invites WHERE invite_date = ?"
+        " AND status = 'pending'",
+        (today_str,),
+        one=True,
+    )
+    if pending:
+        return pending['user_id'] == current_user_id, False
+
+    # No invite has been issued today yet: pick an eligible user.
+    candidate = query_db(
+        '''
+        SELECT id FROM users
+        WHERE id NOT IN (
+            SELECT user_id FROM daily_invites
+            WHERE created_at >= datetime('now', '-30 days')
+        )
+        ORDER BY RANDOM() LIMIT 1
+        ''',
+        one=True,
+    )
+    if not candidate:
+        return False, False
+
+    # The UNIQUE constraint on invite_date makes this insert fail (and
+    # query_db return None) if another request inserted the day's row first.
+    cur = query_db(
+        "INSERT INTO daily_invites (user_id, invite_date, status)"
+        " VALUES (?, ?, 'pending')",
+        (candidate['id'], today_str),
+        commit=True,
+    )
+    if cur is None:
+        return False, False
+
+    return candidate['id'] == current_user_id, False
+
+
+def respond_to_daily_invite(user_id, action):
+    """Records the user's answer to the daily invite.
+
+    Accepting sets a session flag that turns the user's *next post created
+    today* into the pinned daily discussion. Declining stores the refusal
+    with no penalty of any kind.
+    """
+    if action not in ('accept', 'decline'):
+        return
+
+    today_str = datetime.utcnow().strftime('%Y-%m-%d')
+    new_status = 'accepted' if action == 'accept' else 'declined'
+    query_db(
+        'UPDATE daily_invites SET status = ? WHERE user_id = ?'
+        ' AND invite_date = ?',
+        (new_status, user_id, today_str),
+        commit=True,
+    )
+    if action == 'accept':
+        session['daily_prompt_date'] = today_str
+        flash('Great! Your next post will be pinned on top of the feed as the'
+              ' official discussion of the day.', 'success')
+    else:
+        flash('No problem! Thanks for being part of our community.', 'info')
+
+
 @app.route('/')
 def feed():
     #  1. Get Pagination and Filter Parameters 
@@ -121,9 +416,13 @@ def feed():
     # Add the pagination parameters to the query arguments
     pagination_params = (POSTS_PER_PAGE, offset)
 
+    # The daily discussion post (Implementation C) stays pinned at the top in
+    # every sort order
+    pinned_order = 'ORDER BY p.is_pinned DESC,'
+
     if sort == 'popular':
         query = f"""
-            SELECT p.id, p.content, p.created_at, u.username, u.id as user_id,
+            SELECT p.id, p.content, p.created_at, p.is_pinned, p.is_daily_prompt, u.username, u.id as user_id,
                    IFNULL(r.total_reactions, 0) as total_reactions
             FROM posts p
             JOIN users u ON p.user_id = u.id
@@ -131,7 +430,7 @@ def feed():
                 SELECT post_id, COUNT(*) as total_reactions FROM reactions GROUP BY post_id
             ) r ON p.id = r.post_id
             {where_clause}
-            ORDER BY total_reactions DESC, p.created_at DESC
+            {pinned_order} total_reactions DESC, p.created_at DESC
             LIMIT ? OFFSET ?
         """
         final_params = params + list(pagination_params)
@@ -140,11 +439,11 @@ def feed():
         posts = recommend(current_user_id, show == 'following' and current_user_id)
     else:  # Default sort is 'new'
         query = f"""
-            SELECT p.id, p.content, p.created_at, u.username, u.id as user_id
+            SELECT p.id, p.content, p.created_at, p.is_pinned, p.is_daily_prompt, u.username, u.id as user_id
             FROM posts p
             JOIN users u ON p.user_id = u.id
             {where_clause}
-            ORDER BY p.created_at DESC
+            {pinned_order} p.created_at DESC
             LIMIT ? OFFSET ?
         """
         final_params = params + list(pagination_params)
@@ -191,15 +490,35 @@ def feed():
             'comments': comments_moderated
         })
 
-    #  4. Render Template with Pagination Info 
-    return render_template('feed.html.j2', 
-                           posts=posts_data, 
+    # Attach the monthly badge (Implementation A) to every comment author on
+    # the page. Badges are computed in a single batched lookup instead of one
+    # COUNT query per comment.
+    all_comment_author_ids = list({
+        comment['user_id']
+        for entry in posts_data
+        for comment in entry['comments']
+    })
+    author_badges = get_badges_for_users(all_comment_author_ids)
+    for entry in posts_data:
+        for comment in entry['comments']:
+            comment['author_badge'] = author_badges.get(comment['user_id'], '')
+
+    # Daily invite banner (Implementation C) and the previous month summary
+    # card (Implementation B), both rendered for the logged-in user
+    show_daily_invite, _ = get_daily_invite_status(current_user_id)
+    prev_month_summary = get_previous_month_summary(current_user_id)
+
+    #  4. Render Template with Pagination Info
+    return render_template('feed.html.j2',
+                           posts=posts_data,
                            current_sort=sort,
                            current_show=show,
                            page=page, # Pass current page number
                            per_page=POSTS_PER_PAGE, # Pass items per page
                            reaction_emojis=REACTION_EMOJIS,
-                           reaction_types=REACTION_TYPES)
+                           reaction_types=REACTION_TYPES,
+                           show_daily_invite=show_daily_invite,
+                           prev_month_summary=prev_month_summary)
 
 @app.route('/posts/new', methods=['POST'])
 def add_post():
@@ -216,19 +535,53 @@ def add_post():
 
     # Pass the user's content through the moderation function
     moderated_content = content
+    if moderated_content:
+        moderated_content, _ = moderate_content(moderated_content)
+
+    # Implementation C: if the user accepted today's daily invite, their next
+    # post created *today* becomes the pinned daily discussion. The session
+    # flag carries the date so it expires with the day and cannot turn posts
+    # written on later days into a pinned post.
+    today_str = datetime.utcnow().strftime('%Y-%m-%d')
+    is_daily = session.pop('daily_prompt_date', None) == today_str
 
     # Basic validation to ensure post is not empty
     if moderated_content and moderated_content.strip():
         db = get_db()
-        db.execute('INSERT INTO posts (user_id, content) VALUES (?, ?)',
-                   (user_id, moderated_content))
+        db.execute(
+            'INSERT INTO posts (user_id, content, is_pinned, is_daily_prompt)'
+            ' VALUES (?, ?, ?, ?)',
+            (user_id, moderated_content, 1 if is_daily else 0,
+             1 if is_daily else 0)
+        )
         db.commit()
-        flash('Your post was successfully created!', 'success')
+        if is_daily:
+            flash('Your Question/Comment of the Day has been published and'
+                  ' pinned to the top of the feed!', 'success')
+        else:
+            flash('Your post was successfully created!', 'success')
     else:
         # This will catch empty posts or posts that were fully censored
         flash('Post cannot be empty or was fully censored.', 'warning')
 
     # Redirect back to the main feed to see the new post
+    return redirect(url_for('feed'))
+
+
+@app.route('/daily_invite/respond', methods=['POST'])
+def respond_daily_invite():
+    """Handles the user's answer to the daily Question/Comment invite.
+
+    The invite is non-binding: declining needs no reason and has no penalty,
+    nor does it affect the level, the profile or future selection chances.
+    """
+    user_id = session.get('user_id')
+    if not user_id:
+        flash('You must be logged in to respond.', 'danger')
+        return redirect(url_for('login'))
+
+    action = request.form.get('action')
+    respond_to_daily_invite(user_id, action)
     return redirect(url_for('feed'))
     
     
@@ -277,6 +630,12 @@ def user_profile(username):
         abort(404)
 
     user = dict(user_raw)
+
+    # Monthly participation tier (Implementation A), shown on the profile too
+    badge_emoji, level_name, _, _ = get_user_badge(user['id'])
+    user['badge'] = badge_emoji
+    user['level_name'] = level_name
+
     moderated_bio, _ = moderate_content(user.get('profile', ''))
     user['profile'] = moderated_bio
 
@@ -354,7 +713,7 @@ def post_detail(post_id):
     """Displays a single post and its comments, with content moderation applied."""
     
     post_raw = query_db('''
-        SELECT p.id, p.content, p.created_at, u.username, u.id as user_id
+        SELECT p.id, p.content, p.created_at, p.is_pinned, p.is_daily_prompt, u.username, u.id as user_id
         FROM posts p
         JOIN users u ON p.user_id = u.id
         WHERE p.id = ?
@@ -390,6 +749,11 @@ def post_detail(post_id):
         moderated_comment_content, _ = moderate_content(comment['content'])
         comment['content'] = moderated_comment_content
         comments.append(comment)
+
+    # Monthly badge (Implementation A) for every comment author, batched
+    author_badges = get_badges_for_users(list({c['user_id'] for c in comments}))
+    for comment in comments:
+        comment['author_badge'] = author_badges.get(comment['user_id'], '')
 
     # Pass the moderated data to the template
     return render_template('post_detail.html.j2',
@@ -570,7 +934,9 @@ def add_reaction():
                    (new_reaction_type, existing_reaction['id']))
     else:
         # Step 3: If it does not exist, INSERT a new reaction.
-        db.execute('INSERT INTO reactions (post_id, user_id, reaction_type) VALUES (?, ?, ?)',
+        # created_at is set explicitly so the reaction is countable for the
+        # monthly tier levels (Implementation A).
+        db.execute('INSERT INTO reactions (post_id, user_id, reaction_type, created_at) VALUES (?, ?, ?, CURRENT_TIMESTAMP)',
                    (post_id, user_id, new_reaction_type))
 
     db.commit()
@@ -939,5 +1305,7 @@ def recommend(user_id, filter_following):
     return recommended_posts;
 
 if __name__ == '__main__':
+    # One-time (idempotent) migration for the tier system and daily prompt
+    init_db_schema()
     app.run(debug=True, port=8080)
 

@@ -9,7 +9,10 @@
     <div class="row g-0 align-items-center">
       <div class="col-md-12">
         <div class="card-body">
-          <h2 class="card-title">{{ user_display(user.username) }}</h2>
+          <h2 class="card-title">{{ user_display(user.username) }} {% if user.badge %}<span title="Monthly level: {{ user.level_name }}">{{ user.badge }}</span>{% endif %}</h2>
+          {% if user.level_name != 'Base' %}
+          <p class="card-subtitle text-muted mb-2">Livello del mese: {{ user.level_name }}</p>
+          {% endif %}
           <p class="card-text text-muted mb-3">
             <strong>Location:</strong> {{ user.location or "N/A" }}<br>
             <strong>Birthdate:</strong> {{ user.birthdate or "N/A" }}<br>
