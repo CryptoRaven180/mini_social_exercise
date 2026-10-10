@@ -26,16 +26,16 @@
 {% if show_daily_invite %}
 <div class="col-md-8 mx-auto mb-4">
   <div class="alert alert-warning border-primary shadow-sm p-3">
-    <h5 class="alert-heading">🌟 Ciao <strong>{{ session.get('username') }}</strong>, ti andrebbe di avviare la discussione di oggi?</h5>
-    <p class="mb-2">La tua voce è importante per la nostra community: potresti porre la Domanda o Commento del Giorno e lanciare una discussione con gli altri utenti. L'invito è del tutto facoltativo: puoi rifiutare senza fornire motivazioni, senza penalità e senza conseguenze sul tuo profilo o livello.</p>
+    <h5 class="alert-heading">🌟 Hello <strong>{{ session.get('username') }}</strong>, Would you like to start today's discussion?</h5>
+    <p class="mb-2">Your voice matters to our community. Would you be willing to post the Question or Comment of the Day and start a discussion with other users? The invitation is entirely optional: you can decline without giving a reason, with no penalties or consequences for your profile or level.</p>
     <div class="mt-2">
       <form action="{{ url_for('respond_daily_invite') }}" method="POST" class="d-inline">
         <input type="hidden" name="action" value="accept">
-        <button type="submit" class="btn btn-success btn-sm fw-bold">Accetta e crea la discussione</button>
+        <button type="submit" class="btn btn-success btn-sm fw-bold">Accept and start the discussion</button>
       </form>
       <form action="{{ url_for('respond_daily_invite') }}" method="POST" class="d-inline ms-2">
         <input type="hidden" name="action" value="decline">
-        <button type="submit" class="btn btn-outline-secondary btn-sm">Rifiuta (senza penalità)</button>
+        <button type="submit" class="btn btn-outline-secondary btn-sm">Decline (no penalty)</button>
       </form>
     </div>
   </div>
@@ -47,15 +47,15 @@
 <div class="col-md-8 mx-auto mb-4">
   <div class="card border-info shadow-sm">
     <div class="card-body text-center">
-      <h5 class="card-title text-info">📊 Il tuo Resoconto di {{ prev_month_summary.month }}</h5>
+      <h5 class="card-title text-info">📊 Your Report of {{ prev_month_summary.month }}</h5>
       <p class="card-text mb-1">
-        Nel mese appena concluso hai inviato <strong>{{ prev_month_summary.comments }} commenti</strong>
-        e espresso <strong>{{ prev_month_summary.reactions }} reazioni</strong>.
+        In the past month, you have sent <strong>{{ prev_month_summary.comments }} comments</strong>
+        and expressed <strong>{{ prev_month_summary.reactions }} reactions</strong>.
       </p>
       {% if prev_month_summary.badge %}
-      <h6 class="mt-2 mb-0">Livello raggiunto: <span class="badge bg-primary p-2">{{ prev_month_summary.badge }} {{ prev_month_summary.level }}</span></h6>
+      <h6 class="mt-2 mb-0">Level reached: <span class="badge bg-primary p-2">{{ prev_month_summary.badge }} {{ prev_month_summary.level }}</span></h6>
       {% else %}
-      <h6 class="mt-2 mb-0">Livello raggiunto: <span class="badge bg-secondary p-2">{{ prev_month_summary.level }}</span></h6>
+      <h6 class="mt-2 mb-0">Level reached: <span class="badge bg-secondary p-2">{{ prev_month_summary.level }}</span></h6>
       {% endif %}
     </div>
   </div>
@@ -93,8 +93,8 @@
     {% if entry.post.is_pinned %}
     <!-- Implementation C: visual highlight for the pinned daily discussion -->
     <div class="card-header bg-warning text-dark fw-bold d-flex justify-content-between align-items-center">
-      <span>📌 Discussione Ufficiale del Giorno</span>
-      <span class="badge bg-dark">In Evidenza</span>
+      <span>📌 Official Discussion of the Day</span>
+      <span class="badge bg-dark">Featured</span>
     </div>
     {% endif %}
     <div class="card-body">

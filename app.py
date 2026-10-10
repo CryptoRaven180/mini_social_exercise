@@ -417,8 +417,9 @@ def feed():
     pagination_params = (POSTS_PER_PAGE, offset)
 
     # The daily discussion post (Implementation C) stays pinned at the top in
-    # every sort order
-    pinned_order = 'ORDER BY p.is_pinned DESC,'
+    # every sort order, but only on the day it was created — older daily
+    # posts fall back to the normal ordering
+    pinned_order = "ORDER BY (p.is_pinned = 1 AND date(p.created_at) = date('now')) DESC,"
 
     if sort == 'popular':
         query = f"""
@@ -1306,6 +1307,7 @@ def recommend(user_id, filter_following):
 
 if __name__ == '__main__':
     # One-time (idempotent) migration for the tier system and daily prompt
-    init_db_schema()
+    with app.app_context():
+      init_db_schema()
     app.run(debug=True, port=8080)
 
