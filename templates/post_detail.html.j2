@@ -23,6 +23,10 @@
         {% endif %}
       </div>
       
+      {% if post.is_daily_prompt %}
+      <!-- Implementation C: the official discussion of the day -->
+      <div class="alert alert-warning py-2 px-3 mt-2 mb-0">📌 Official Discussion of the Day</div>
+      {% endif %}
       <p class="card-text mt-2">{{ post.content }}</p>
 
       <!-- Reactions Display and Add Reaction Button (Copied from feed.html.j2) -->
@@ -82,7 +86,7 @@
         <li class="card shadow-none p-2 mt-2">
           <div class="d-flex justify-content-between">
             <div>
-              <strong><a href="/u/{{ comment.username }}">{{ user_display(comment.username) }}</a></strong>
+              <strong><a href="/u/{{ comment.username }}">{{ user_display(comment.username) }}</a> {{ comment.author_badge }}</strong>
               <p class="mb-0">{{ comment.content }}</p>
               
             

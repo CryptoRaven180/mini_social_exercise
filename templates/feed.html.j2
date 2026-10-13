@@ -22,6 +22,46 @@
 </div>
 {% endif %}
 
+<!-- Implementation C: private daily invite banner (only the selected user sees it) -->
+{% if show_daily_invite %}
+<div class="col-md-8 mx-auto mb-4">
+  <div class="alert alert-warning border-primary shadow-sm p-3">
+    <h5 class="alert-heading">🌟 Hello <strong>{{ session.get('username') }}</strong>, Would you like to start today's discussion?</h5>
+    <p class="mb-2">Your voice matters to our community. Would you be willing to post the Question or Comment of the Day and start a discussion with other users? The invitation is entirely optional: you can decline without giving a reason, with no penalties or consequences for your profile or level.</p>
+    <div class="mt-2">
+      <form action="{{ url_for('respond_daily_invite') }}" method="POST" class="d-inline">
+        <input type="hidden" name="action" value="accept">
+        <button type="submit" class="btn btn-success btn-sm fw-bold">Accept and start the discussion</button>
+      </form>
+      <form action="{{ url_for('respond_daily_invite') }}" method="POST" class="d-inline ms-2">
+        <input type="hidden" name="action" value="decline">
+        <button type="submit" class="btn btn-outline-secondary btn-sm">Decline (no penalty)</button>
+      </form>
+    </div>
+  </div>
+</div>
+{% endif %}
+
+<!-- Implementation B: visual summary of the previous month's activity -->
+{% if prev_month_summary %}
+<div class="col-md-8 mx-auto mb-4">
+  <div class="card border-info shadow-sm">
+    <div class="card-body text-center">
+      <h5 class="card-title text-info">📊 Your Report of {{ prev_month_summary.month }}</h5>
+      <p class="card-text mb-1">
+        In the past month, you have sent <strong>{{ prev_month_summary.comments }} comments</strong>
+        and expressed <strong>{{ prev_month_summary.reactions }} reactions</strong>.
+      </p>
+      {% if prev_month_summary.badge %}
+      <h6 class="mt-2 mb-0">Level reached: <span class="badge bg-primary p-2">{{ prev_month_summary.badge }} {{ prev_month_summary.level }}</span></h6>
+      {% else %}
+      <h6 class="mt-2 mb-0">Level reached: <span class="badge bg-secondary p-2">{{ prev_month_summary.level }}</span></h6>
+      {% endif %}
+    </div>
+  </div>
+</div>
+{% endif %}
+
 <h2 class="text-center border-bottom pb-2 mb-4"><span>Posts</span></h2>
 
 <div class="mb-4 text-center">
@@ -49,7 +89,14 @@
 
 <div class="col-md-8 mx-auto">
   {% for entry in posts %}
-  <div class="card mb-4" id="post-{{ entry.post.id }}">
+  <div class="card mb-4 {% if entry.post.is_pinned %}border-warning shadow-lg{% endif %}" id="post-{{ entry.post.id }}">
+    {% if entry.post.is_pinned %}
+    <!-- Implementation C: visual highlight for the pinned daily discussion -->
+    <div class="card-header bg-warning text-dark fw-bold d-flex justify-content-between align-items-center">
+      <span>📌 Official Discussion of the Day</span>
+      <span class="badge bg-dark">Featured</span>
+    </div>
+    {% endif %}
     <div class="card-body">
       <div class="d-flex justify-content-between align-items-center">
         <h3 class="card-title mb-0">
@@ -138,10 +185,10 @@
         <li class="card shadow-none p-2 mt-2">
           <div class="d-flex justify-content-between">
             <div>
-              <strong><a href="/u/{{ comment.username }}">{{ user_display(comment.username) }}</a></strong>
+              <strong><a href="/u/{{ comment.username }}">{{ user_display(comment.username) }}</a> {{ comment.author_badge }}</strong>
               <p class="mb-0">{{ comment.content }}</p>
             </div>
-            
+
             {% if session.get('user_id') == comment.user_id or session.get('user_id') == entry.post.user_id %}
             <form action="{{ url_for('delete_comment', comment_id=comment.id) }}" method="POST" onsubmit="return confirm('Are you sure you want to delete this comment?');">
                 <button type="submit" class="btn btn-sm btn-danger" title="Delete Comment">delete</button>
