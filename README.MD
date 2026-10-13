@@ -33,20 +33,7 @@ Once a day, the system automatically selects one user and asks them — through 
 - If the user accepts, their next post created within the day is published as the **pinned post**: it stays at the top of the feed in every sort order and has a distinctive visual highlight ("📌 Discussione Ufficiale del Giorno").
 - Key routes/functions: `get_daily_invite_status()`, `respond_to_daily_invite()`, `/daily_invite/respond` in `app.py`.
 
-### Design choices worth knowing
 
-- The "private notification" is implemented as a banner shown only to the selected user (the app has no notification system).
-- The monthly summary is generated lazily on the first feed visit of the new month, not by a scheduled job.
-- The selected user sees the invite until they answer; after a refusal no new user is invited that same day (one invite per day).
-- All tier boundaries use UTC timestamps to match the ones written by SQLite.
-
-### Testing
-
-An automated smoke test runs the whole system (schema migration, thresholds, badges, invite flow, pinned post) against a temporary **copy** of the database:
-
-```
-python var/smoke_test_tier.py
-```
 
 Manual testing tips: thresholds refer to the current calendar month, so to see a badge quickly, add ~50 comments and ~100 reactions as a test user during the current month, or adjust `MONTHLY_TIERS` in `app.py` for local trials.
 
