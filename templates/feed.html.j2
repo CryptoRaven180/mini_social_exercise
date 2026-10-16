@@ -22,6 +22,28 @@
 </div>
 {% endif %}
 
+<!-- Implementation D: unacknowledged admin-strike notices (only the sanctioned author sees them) -->
+{% if strike_notifications %}
+<div class="col-md-8 mx-auto mb-4">
+  <div class="alert alert-danger border-danger shadow-sm p-3">
+    <h5 class="alert-heading">⚠️ Moderation notice</h5>
+    <ul class="mb-2">
+      {% for strike in strike_notifications %}
+      {% if strike.post_id %}
+      <li>Your post from {{ strike.post_created_at|datetimeformat }} has
+          received a strike from the administrator.</li>
+      {% else %}
+      <li>Your comment from{{ strike.comment_created_at|datetimeformat }} has 
+          received a strike from the administrator.</li>
+      {% endif %}
+      {% endfor %}
+    </ul>
+    <p class="mb-0">You have <strong>{{ strikes_remaining }}</strong> strike
+      remaining before receiving a 30-day suspension.</p>
+  </div>
+</div>
+{% endif %}
+
 <!-- Implementation C: private daily invite banner (only the selected user sees it) -->
 {% if show_daily_invite %}
 <div class="col-md-8 mx-auto mb-4">
