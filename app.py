@@ -6,7 +6,7 @@ import json
 import sqlite3
 import hashlib
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 
 app = Flask(__name__)
 app.secret_key = '123456789' 
@@ -108,10 +108,12 @@ def init_db_schema():
                 db.execute(
                     'ALTER TABLE reactions ADD COLUMN created_at TIMESTAMP'
                 )
-            db.execute(
-                'UPDATE reactions SET created_at = CURRENT_TIMESTAMP'
-                ' WHERE created_at IS NULL'
-            )
+            # Historical reactions keep created_at NULL on purpose:
+            # CURRENT_TIMESTAMP here would label every pre-migration reaction
+            # with the migration day, and the monthly badge counts
+            # (created_at >= month_start) would then treat them as if made
+            # this month. Every count query excludes NULL implicitly
+            # (>= never matches NULL), so legacy reactions simply do not count.
             db.execute(
                 'CREATE INDEX IF NOT EXISTS idx_reactions_user_date'
                 ' ON reactions(user_id, created_at)'
@@ -139,13 +141,83 @@ def init_db_schema():
                     'ALTER TABLE posts ADD COLUMN is_daily_prompt'
                     ' INTEGER DEFAULT 0'
                 )
+            
+            if 'content_score' not in columns:
+                db.execute(
+                    'ALTER TABLE posts ADD COLUMN content_score'
+                    ' REAL DEFAULT NULL'
+                )
+            
+            db.execute(
+                '''
+                CREATE TABLE IF NOT EXISTS strikes (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    post_id INTEGER,
+                    acknowledged INTEGER DEFAULT 0,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY(user_id) REFERENCES users(id),
+                    FOREIGN KEY(post_id) REFERENCES posts(id)
+                )
+                '''
+            )
+            db.execute(
+                'CREATE INDEX IF NOT EXISTS idx_strikes_user_date'
+                ' ON strikes(user_id, created_at)'
+            )
+            
+            cursor = db.execute('PRAGMA table_info(strikes)')
+            columns = [column[1] for column in cursor.fetchall()]
+            if 'comment_id' not in columns:
+                db.execute(
+                    'ALTER TABLE strikes ADD COLUMN comment_id'
+                    ' INTEGER DEFAULT NULL'
+                )
+            
+            cursor = db.execute('PRAGMA table_info(comments)')
+            columns = [column[1] for column in cursor.fetchall()]
+            if 'content_score' not in columns:
+                db.execute(
+                    'ALTER TABLE comments ADD COLUMN content_score'
+                    ' REAL DEFAULT NULL'
+                )
+            
+            db.execute(
+                'CREATE INDEX IF NOT EXISTS idx_posts_user_id'
+                ' ON posts(user_id)'
+            )
+            
+            unscored_posts = db.execute(
+                'SELECT id, content FROM posts WHERE content_score IS NULL'
+            ).fetchall()
+            post_updates = [
+                (moderate_content(row['content'] or '')[1], row['id'])
+                for row in unscored_posts
+            ]
+            if post_updates:
+                db.executemany(
+                    'UPDATE posts SET content_score = ? WHERE id = ?',
+                    post_updates
+                )
+            unscored_comments = db.execute(
+                'SELECT id, content FROM comments WHERE content_score IS NULL'
+            ).fetchall()
+            comment_updates = [
+                (moderate_content(row['content'] or '')[1], row['id'])
+                for row in unscored_comments
+            ]
+            if comment_updates:
+                db.executemany(
+                    'UPDATE comments SET content_score = ? WHERE id = ?',
+                    comment_updates
+                )
     except sqlite3.Error as e:
         print(f'Schema initialization error: {e}')
 
 
 MONTHLY_TIERS = [
-    {'name': 'Gold', 'emoji': '🥇', 'comments': 100, 'reactions': 200},
-    {'name': 'Silver', 'emoji': '🥈', 'comments': 50, 'reactions': 100},
+    {'name': 'Gold', 'emoji': '🥇', 'comments': 7, 'reactions': 3},
+    {'name': 'Silver', 'emoji': '🥈', 'comments': 6, 'reactions': 2},
 ]
 
 
@@ -332,29 +404,125 @@ def get_daily_invite_status(current_user_id):
 
 
 def respond_to_daily_invite(user_id, action):
-    """Records the user's answer to the daily invite.
+    """Records the invited user's answer to their daily invite.
 
-    Accepting sets a session flag that turns the user's *next post created
-    today* into the pinned daily discussion. Declining stores the refusal
-    with no penalty of any kind.
+    Only an UPDATE that actually matches today's *pending* invite row for
+    this user (i.e. this user is the invited one) counts as an answer:
+    forged or duplicate responses from other users, or answered invites,
+    are rejected with a neutral message. Accepting sets a session flag that
+    turns the user's *next post created today* into the pinned daily
+    discussion. Declining stores the refusal with no penalty of any kind.
+    The answer is one-shot: the `status = 'pending'` filter makes the first
+    response final.
     """
     if action not in ('accept', 'decline'):
         return
 
     today_str = datetime.utcnow().strftime('%Y-%m-%d')
     new_status = 'accepted' if action == 'accept' else 'declined'
-    query_db(
+    cur = query_db(
         'UPDATE daily_invites SET status = ? WHERE user_id = ?'
-        ' AND invite_date = ?',
-        (new_status, user_id, today_str),
+        ' AND invite_date = ? AND status = ?',
+        (new_status, user_id, today_str, 'pending'),
         commit=True,
     )
+    if cur is None or cur.rowcount == 0:
+        # No pending invitation for this user today (direct POST from a
+        # non-invited account, already answered invite, or a DB error).
+        # Never touch the session flag here; the neutral wording does not
+        # reveal who was invited nor whether an invite exists at all.
+        flash('You have no pending invitation today.', 'info')
+        return
+
     if action == 'accept':
         session['daily_prompt_date'] = today_str
         flash('Great! Your next post will be pinned on top of the feed as the'
               ' official discussion of the day.', 'success')
     else:
         flash('No problem! Thanks for being part of our community.', 'info')
+
+
+def get_strike_notifications(current_user_id):
+    """Implementation D: strikes not yet shown to their author, plus how many
+    recent strikes separate them from the 30-day suspension.
+
+    Uses the same mobile 30-day window as the login suspension check, so the
+    remaining counter stays consistent with the blocking rule.
+
+    Returns:
+        A tuple (unacknowledged_strikes, strikes_remaining) where
+        unacknowledged_strikes is a list of dicts (id, post_id, comment_id,
+        strike_created_at, post_created_at, comment_created_at), possibly
+        empty, and strikes_remaining is how many more strikes the user can
+        take before the 3-in-30-days suspension applies (min 0).
+    """
+    if not current_user_id:
+        return [], 0
+
+    
+    unacknowledged = query_db(
+        'SELECT s.id, s.post_id, s.comment_id,'
+        ' s.created_at AS strike_created_at,'
+        ' p.created_at AS post_created_at,'
+        ' c.created_at AS comment_created_at'
+        ' FROM strikes s'
+        ' LEFT JOIN posts p ON p.id = s.post_id'
+        ' LEFT JOIN comments c ON c.id = s.comment_id'
+        ' WHERE s.user_id = ? AND s.acknowledged = 0'
+        ' ORDER BY s.created_at DESC',
+        (current_user_id,)
+    )
+    unacknowledged = (
+        [dict(row) for row in unacknowledged] if unacknowledged else []
+    )
+    for strike in unacknowledged:
+        if strike['post_id'] and strike['post_created_at'] is None:
+            # Post deleted after the strike: fall back to the strike's own
+            # date so the banner never shows a blank date.
+            strike['post_created_at'] = strike['strike_created_at']
+        if strike['comment_id'] and strike['comment_created_at'] is None:
+            # Same defensive rule for deleted comments.
+            strike['comment_created_at'] = strike['strike_created_at']
+
+    strike_cutoff = (
+        datetime.utcnow() - timedelta(days=30)
+    ).strftime('%Y-%m-%d %H:%M:%S')
+    recent = query_db(
+        'SELECT COUNT(*) as cnt FROM strikes WHERE user_id = ?'
+        ' AND created_at >= ?',
+        (current_user_id, strike_cutoff),
+        one=True
+    )
+    recent_count = recent['cnt'] if recent else 0
+    strikes_remaining = max(0, 3 - recent_count)
+
+    return unacknowledged, strikes_remaining
+
+
+def get_suspension(user_id, username=None):
+    """Implementation D: 30-day suspension after 3 strikes in 30 days.
+    """
+    if not user_id:
+        return None
+
+    strike_cutoff = (
+        datetime.utcnow() - timedelta(days=30)
+    ).strftime('%Y-%m-%d %H:%M:%S')
+    recent = query_db(
+        'SELECT COUNT(*) as cnt, MAX(created_at) as third_strike'
+        ' FROM (SELECT created_at FROM strikes'
+        '       WHERE user_id = ? AND created_at >= ?'
+        '       ORDER BY created_at DESC LIMIT 3)',
+        (user_id, strike_cutoff),
+        one=True,
+    )
+    recent_count = recent['cnt'] if recent else 0
+    if recent_count < 3:
+        return None
+    if username == 'admin':
+        # Defensive guard: the admin can issue strikes but never be suspended.
+        return None
+    return {'since': recent['third_strike']}
 
 
 @app.route('/')
@@ -469,6 +637,21 @@ def feed():
     show_daily_invite, _ = get_daily_invite_status(current_user_id)
     prev_month_summary = get_previous_month_summary(current_user_id)
 
+    # Implementation D: fetch and show pending strike notices on the landing
+    # page (same private-banner pattern as the daily invite). The banner has
+    # now been shown, so mark these strikes as acknowledged: they will not be
+    # rendered again on the next visit.
+    strike_notifications, strikes_remaining = (
+        get_strike_notifications(current_user_id)
+    )
+    if strike_notifications:
+        query_db(
+            'UPDATE strikes SET acknowledged = 1 WHERE user_id = ?'
+            ' AND acknowledged = 0',
+            (current_user_id,),
+            commit=True,
+        )
+
     #  Render Template with Pagination Info
     return render_template('feed.html.j2',
                            posts=posts_data,
@@ -479,7 +662,9 @@ def feed():
                            reaction_emojis=REACTION_EMOJIS,
                            reaction_types=REACTION_TYPES,
                            show_daily_invite=show_daily_invite,
-                           prev_month_summary=prev_month_summary)
+                           prev_month_summary=prev_month_summary,
+                           strike_notifications=strike_notifications,
+                           strikes_remaining=strikes_remaining)
 
 @app.route('/posts/new', methods=['POST'])
 def add_post():
@@ -495,9 +680,10 @@ def add_post():
     content = request.form.get('content')
 
     # Pass the user's content through the moderation function
+    content_score = 0.0
     moderated_content = content
     if moderated_content:
-        moderated_content, _ = moderate_content(moderated_content)
+        moderated_content, content_score = moderate_content(moderated_content)
 
     today_str = datetime.utcnow().strftime('%Y-%m-%d')
     is_daily = session.pop('daily_prompt_date', None) == today_str
@@ -506,10 +692,10 @@ def add_post():
     if moderated_content and moderated_content.strip():
         db = get_db()
         db.execute(
-            'INSERT INTO posts (user_id, content, is_pinned, is_daily_prompt)'
-            ' VALUES (?, ?, ?, ?)',
+            'INSERT INTO posts (user_id, content, is_pinned, is_daily_prompt,'
+            ' content_score) VALUES (?, ?, ?, ?, ?)',
             (user_id, moderated_content, 1 if is_daily else 0,
-             1 if is_daily else 0)
+             1 if is_daily else 0, content_score)
         )
         db.commit()
         if is_daily:
@@ -771,15 +957,23 @@ def login():
         username = request.form['username']
         password = request.form['password']
 
-        db = get_db()
-        user = db.execute('SELECT * FROM users WHERE username = ?', (username,)).fetchone()
-        db.close()
+        user = query_db('SELECT * FROM users WHERE username = ?', (username,), one=True)
 
         # 1. Check if the user exists.
         # 2. If user exists, use check_password_hash to securely compare the password.
         #    This function handles the salt and prevents timing attacks.
         if user and check_password_hash(user['password'], password):
             # Password is correct!
+
+            # Implementation D: 3 strikes in the last 30 days -> the account
+            # is temporarily suspended. The window is computed dynamically, so
+            # strikes older than 30 days stop counting by themselves 
+            suspension = get_suspension(user['id'], user['username'])
+            if suspension:
+                # Blocked users get a dedicated banner on the login page
+                # (login.html.j2); the session is never created.
+                return render_template('login.html.j2', suspension=suspension)
+
             session['user_id'] = user['id']
             session['username'] = user['username']
             flash('Logged in successfully.', 'success')
@@ -811,9 +1005,12 @@ def add_comment(post_id):
 
     # Basic validation to ensure comment is not empty
     if content and content.strip():
+        # Score the raw content at write time (Round 2). The text is still
+        # stored unmoderated: censorship happens on read, as before.
+        _, content_score = moderate_content(content)
         db = get_db()
-        db.execute('INSERT INTO comments (post_id, user_id, content) VALUES (?, ?, ?)',
-                   (post_id, user_id, content))
+        db.execute('INSERT INTO comments (post_id, user_id, content, content_score) VALUES (?, ?, ?, ?)',
+                   (post_id, user_id, content, content_score))
         db.commit()
         flash('Your comment was added.', 'success')
     else:
@@ -1023,80 +1220,95 @@ def admin_dashboard():
     
     current_tab = request.args.get('tab', 'users') # Default to 'users' tab
 
-    users_offset = (users_page - 1) * PAGE_SIZE
-    
-    # First, get all users to calculate risk, then apply pagination in Python
-    # It's more complex to do this efficiently in SQL if risk calc is Python-side
-    all_users_raw = query_db('SELECT id, username, profile, created_at FROM users')
-    all_users = []
-    for user in all_users_raw:
-        user_dict = dict(user)
-        user_risk_score = user_risk_analysis(user_dict['id'])
-        risk_label, risk_sort_key = get_risk_profile(user_risk_score)
-        user_dict['risk_label'] = risk_label
-        user_dict['risk_sort_key'] = risk_sort_key
-        user_dict['risk_score'] = min(5.0, round(user_risk_score, 2))
-        all_users.append(user_dict)
+    # Round 2 (Implementation A): only the active tab's data gets computed.
+    # A tab switch is a full page load (?tab=...), so the inactive panes
+    # receive empty lists; the pagination counts stay cheap and are provided
+    # for every tab (the template uses them in each pane's pager).
+    users, posts, comments = [], [], []
+    total_users_pages = total_posts_pages = total_comments_pages = 1
 
-    all_users.sort(key=lambda x: x['risk_score'], reverse=True)
-    total_users = len(all_users)
-    users = all_users[users_offset : users_offset + PAGE_SIZE]
-    total_users_pages = (total_users + PAGE_SIZE - 1) // PAGE_SIZE
+    if current_tab == 'users':
+        users_offset = (users_page - 1) * PAGE_SIZE
 
-    # --- Posts Tab Data ---
-    posts_offset = (posts_page - 1) * PAGE_SIZE
-    total_posts_count = query_db('SELECT COUNT(*) as count FROM posts', one=True)['count']
-    total_posts_pages = (total_posts_count + PAGE_SIZE - 1) // PAGE_SIZE
+        # First, get all users to calculate risk, then apply pagination in Python
+        # It's more complex to do this efficiently in SQL if risk calc is Python-side
+        all_users_raw = query_db('SELECT id, username, profile, created_at FROM users')
+        all_users = []
+        for user in all_users_raw:
+            user_dict = dict(user)
+            user_risk_score = user_risk_analysis(user_dict['id'])
+            risk_label, risk_sort_key = get_risk_profile(user_risk_score)
+            user_dict['risk_label'] = risk_label
+            user_dict['risk_sort_key'] = risk_sort_key
+            user_dict['risk_score'] = min(5.0, round(user_risk_score, 2))
+            all_users.append(user_dict)
 
-    posts_raw = query_db(f'''
-        SELECT p.id, p.content, p.created_at, u.username, u.created_at as user_created_at
-        FROM posts p JOIN users u ON p.user_id = u.id
-        ORDER BY p.id DESC -- Order by ID for consistent pagination before risk sort
-        LIMIT ? OFFSET ?
-    ''', (PAGE_SIZE, posts_offset))
-    posts = []
-    for post in posts_raw:
-        post_dict = dict(post)
-        _, base_score = moderate_content(post_dict['content'])
-        final_score = base_score 
-        author_created_dt = post_dict['user_created_at']
-        author_age_days = (datetime.utcnow() - author_created_dt).days
-        if author_age_days < 7:
-            final_score *= 1.5
-        risk_label, risk_sort_key = get_risk_profile(final_score)
-        post_dict['risk_label'] = risk_label
-        post_dict['risk_sort_key'] = risk_sort_key
-        post_dict['risk_score'] = round(final_score, 2)
-        posts.append(post_dict)
+        all_users.sort(key=lambda x: x['risk_score'], reverse=True)
+        total_users = len(all_users)
+        users = all_users[users_offset : users_offset + PAGE_SIZE]
+        total_users_pages = (total_users + PAGE_SIZE - 1) // PAGE_SIZE
 
-    posts.sort(key=lambda x: x['risk_score'], reverse=True) # Sort after fetching and scoring
+    elif current_tab == 'posts':
+        posts_offset = (posts_page - 1) * PAGE_SIZE
+        total_posts_count = query_db('SELECT COUNT(*) as count FROM posts', one=True)['count']
+        total_posts_pages = (total_posts_count + PAGE_SIZE - 1) // PAGE_SIZE
 
-    # --- Comments Tab Data ---
-    comments_offset = (comments_page - 1) * PAGE_SIZE
-    total_comments_count = query_db('SELECT COUNT(*) as count FROM comments', one=True)['count']
-    total_comments_pages = (total_comments_count + PAGE_SIZE - 1) // PAGE_SIZE
+        posts_raw = query_db(f'''
+            SELECT p.id, p.content, p.content_score, p.created_at, u.username, u.created_at as user_created_at
+            FROM posts p JOIN users u ON p.user_id = u.id
+            ORDER BY p.id DESC -- Order by ID for consistent pagination before risk sort
+            LIMIT ? OFFSET ?
+        ''', (PAGE_SIZE, posts_offset))
+        for post in posts_raw:
+            post_dict = dict(post)
+            # Base score persisted at write time; fall back to live
+            # moderation for rows that missed the backfill (defensive).
+            if post_dict['content_score'] is not None:
+                base_score = post_dict['content_score']
+            else:
+                _, base_score = moderate_content(post_dict['content'] or '')
+            final_score = base_score
+            author_created_dt = post_dict['user_created_at']
+            author_age_days = (datetime.utcnow() - author_created_dt).days
+            if author_age_days < 7:
+                final_score *= 1.5
+            risk_label, risk_sort_key = get_risk_profile(final_score)
+            post_dict['risk_label'] = risk_label
+            post_dict['risk_sort_key'] = risk_sort_key
+            post_dict['risk_score'] = round(final_score, 2)
+            posts.append(post_dict)
 
-    comments_raw = query_db(f'''
-        SELECT c.id, c.content, c.created_at, u.username, u.created_at as user_created_at
-        FROM comments c JOIN users u ON c.user_id = u.id
-        ORDER BY c.id DESC -- Order by ID for consistent pagination before risk sort
-        LIMIT ? OFFSET ?
-    ''', (PAGE_SIZE, comments_offset))
-    comments = []
-    for comment in comments_raw:
-        comment_dict = dict(comment)
-        _, score = moderate_content(comment_dict['content'])
-        author_created_dt = comment_dict['user_created_at']
-        author_age_days = (datetime.utcnow() - author_created_dt).days
-        if author_age_days < 7:
-            score *= 1.5
-        risk_label, risk_sort_key = get_risk_profile(score)
-        comment_dict['risk_label'] = risk_label
-        comment_dict['risk_sort_key'] = risk_sort_key
-        comment_dict['risk_score'] = round(score, 2)
-        comments.append(comment_dict)
+        posts.sort(key=lambda x: x['risk_score'], reverse=True) # Sort after fetching and scoring
 
-    comments.sort(key=lambda x: x['risk_score'], reverse=True) # Sort after fetching and scoring
+    elif current_tab == 'comments':
+        comments_offset = (comments_page - 1) * PAGE_SIZE
+        total_comments_count = query_db('SELECT COUNT(*) as count FROM comments', one=True)['count']
+        total_comments_pages = (total_comments_count + PAGE_SIZE - 1) // PAGE_SIZE
+
+        comments_raw = query_db(f'''
+            SELECT c.id, c.content, c.content_score, c.created_at, u.username, u.created_at as user_created_at
+            FROM comments c JOIN users u ON c.user_id = u.id
+            ORDER BY c.id DESC -- Order by ID for consistent pagination before risk sort
+            LIMIT ? OFFSET ?
+        ''', (PAGE_SIZE, comments_offset))
+        for comment in comments_raw:
+            comment_dict = dict(comment)
+            # Same persisted-score pattern as the posts tab.
+            if comment_dict['content_score'] is not None:
+                score = comment_dict['content_score']
+            else:
+                _, score = moderate_content(comment_dict['content'] or '')
+            author_created_dt = comment_dict['user_created_at']
+            author_age_days = (datetime.utcnow() - author_created_dt).days
+            if author_age_days < 7:
+                score *= 1.5
+            risk_label, risk_sort_key = get_risk_profile(score)
+            comment_dict['risk_label'] = risk_label
+            comment_dict['risk_sort_key'] = risk_sort_key
+            comment_dict['risk_score'] = round(score, 2)
+            comments.append(comment_dict)
+
+        comments.sort(key=lambda x: x['risk_score'], reverse=True) # Sort after fetching and scoring
 
 
     return render_template('admin.html.j2', 
@@ -1171,6 +1383,115 @@ def admin_delete_comment(comment_id):
     flash(f'Comment {comment_id} has been deleted.', 'success')
     return redirect(url_for('admin_dashboard'))
 
+
+@app.route('/admin/posts/<int:post_id>/strike', methods=['POST'])
+def give_strike(post_id):
+    """Implementation D: admin-issued strike on a post.
+
+    Censors the post the same way the automatic Tier 1 moderation would and
+    records a strike row against the post's author. The author sees a banner
+    at their next feed visit and the login suspension check counts the
+    strikes from the last 30 days.
+    """
+    # Same authorization pattern as the other /admin/delete routes: the
+    # admin is identified by the username session key.
+    if session.get('username') != 'admin':
+        flash("You do not have permission to perform this action.", "danger")
+        return redirect(url_for('feed'))
+
+    post = query_db(
+        'SELECT id, user_id, content FROM posts WHERE id = ?', (post_id,), one=True
+    )
+    if not post:
+        flash('Post not found.', 'danger')
+        return redirect(url_for('admin_dashboard'))
+
+    author_info = query_db(
+        'SELECT username FROM users WHERE id = ?', (post['user_id'],), one=True
+    )
+    if author_info and author_info['username'] == 'admin':
+        # Defensive guard: striking the admin would lock the admin out of the
+        # platform on the next login (3-strike suspension check below).
+        flash('The admin account cannot receive strikes.', 'danger')
+        return redirect(url_for('admin_dashboard'))
+
+    db = get_db()
+    # 1. Tier-1-style censorship: same wording the automatic moderation uses
+    #    for severe violations (see moderate_content()).
+    db.execute(
+        "UPDATE posts SET content = '[content removed due to severe violation]',"
+        " content_score = 0.0"
+        " WHERE id = ?",
+        (post_id,)
+    )
+    # 2. Record the strike. acknowledged = 0 so the author's next feed visit
+    #    shows the notification banner; it flips to 1 once the banner renders.
+    db.execute(
+        'INSERT INTO strikes (user_id, post_id, acknowledged) VALUES (?, ?, 0)',
+        (post['user_id'], post_id)
+    )
+    # Both statements are part of one implicit transaction (sqlite3 default):
+    # either the post is censored AND the strike is recorded, or neither.
+    db.commit()
+
+    flash('Strike sent successfully and the post was censored.', 'success')
+    return redirect(url_for('admin_dashboard'))
+
+
+@app.route('/admin/comments/<int:comment_id>/strike', methods=['POST'])
+def give_comment_strike(comment_id):
+    """Implementation D extension: admin-issued strike on a comment.
+
+    Mirrors give_strike(): Tier-1-style censorship of the comment content
+    (with its persisted score re-synced to 0.0) and a strike row against
+    the author (post_id NULL, comment_id set). The banner wording branches
+    on post_id; the 30-day suspension counter counts post and comment
+    strikes together.
+    """
+    # Same authorization pattern as the other /admin/* routes.
+    if session.get('username') != 'admin':
+        flash("You do not have permission to perform this action.", "danger")
+        return redirect(url_for('feed'))
+
+    comment = query_db(
+        'SELECT id, user_id FROM comments WHERE id = ?', (comment_id,), one=True
+    )
+    if not comment:
+        flash('Comment not found.', 'danger')
+        return redirect(url_for('admin_dashboard'))
+
+    author_info = query_db(
+        'SELECT username FROM users WHERE id = ?', (comment['user_id'],), one=True
+    )
+    if author_info and author_info['username'] == 'admin':
+        # Defensive guard, same as give_strike(): striking the admin would
+        # lock the admin out of the platform on the next login.
+        flash('The admin account cannot receive strikes.', 'danger')
+        return redirect(url_for('admin_dashboard'))
+
+    db = get_db()
+    # 1. Tier-1-style censorship, score kept in sync with the new text.
+    db.execute(
+        "UPDATE comments SET content ="
+        " '[content removed due to severe violation]', content_score = 0.0"
+        " WHERE id = ?",
+        (comment_id,)
+    )
+    # 2. Record the strike. post_id NULL + comment_id set marks it as a
+    #    comment strike; acknowledged = 0 so the author's next feed visit
+    #    shows the notification banner.
+    db.execute(
+        'INSERT INTO strikes (user_id, post_id, comment_id, acknowledged)'
+        ' VALUES (?, NULL, ?, 0)',
+        (comment['user_id'], comment_id)
+    )
+    # Both statements are part of one implicit transaction (sqlite3 default):
+    # either the comment is censored AND the strike is recorded, or neither.
+    db.commit()
+
+    flash('Strike sent successfully and the comment was censored.', 'success')
+    return redirect(url_for('admin_dashboard'))
+
 @app.route('/rules')
 def rules():
     return render_template('rules.html.j2')
@@ -1203,12 +1524,99 @@ def user_risk_analysis(user_id):
         Then, navigate to the /admin endpoint. (http://localhost:8080/admin)
     """
     
-    score = 0
+    # The user row: profile text and account age come straight from users.
+    user = query_db(
+        'SELECT id, username, created_at, profile FROM users WHERE id = ?',
+        (user_id,),
+        one=True,
+    )
+    if not user:
+        # Unknown user: nothing to analyse -> no risk (docstring: < 1.0 = no risk).
+        return 0.0
 
-    return score;
+    # Account age in days. PARSE_DECLTYPES normally gives us a datetime; the
+    # isinstance branch keeps the function safe if the column ever comes back
+    # as a string (same defensive style as the datetimeformat template filter).
+    created_at = user['created_at']
+    if isinstance(created_at, str):
+        created_at = datetime.strptime(created_at, '%Y-%m-%d %H:%M:%S')
+    account_age_days = max(0, (datetime.utcnow() - created_at).days)
 
-    
+    # 1. Profile content score.
+    _, profile_score = moderate_content(user['profile'] or '')
+
+    # 2. Average post score (0 when the user has no posts). Scores are
+    #    persisted at write time (Round 2), so the averages are indexed
+    #    lookups instead of re-moderating every text. SQL AVG returns NULL
+    #    on an empty set -> 0.0 per the docstring.
+    posts_res = query_db(
+        'SELECT AVG(content_score) as avg_score FROM posts WHERE user_id = ?',
+        (user_id,),
+        one=True,
+    )
+    average_post_score = (
+        posts_res['avg_score']
+        if posts_res and posts_res['avg_score'] is not None
+        else 0.0
+    )
+
+    # 3. Average comment score (0 when the user has no comments).
+    comments_res = query_db(
+        'SELECT AVG(content_score) as avg_score FROM comments WHERE user_id = ?',
+        (user_id,),
+        one=True,
+    )
+    average_comment_score = (
+        comments_res['avg_score']
+        if comments_res and comments_res['avg_score'] is not None
+        else 0.0
+    )
+
+    # Weighted combination demanded by the assignment: profile = 1, posts = 3.
+    content_risk_score = (
+        (profile_score * 1)
+        + (average_post_score * 3)
+        + (average_comment_score * 1)
+    )
+
+    # Account-age multiplier: the < 7 days check must come first so a very
+    # young account is not downgraded to the 1.2 tier.
+    if account_age_days < 7:
+        content_risk_score *= 1.5
+    elif account_age_days < 30:
+        content_risk_score *= 1.2
+
+    # Upper bound: the docstring promises 5.0 at most (the admin dashboard
+    # also caps, min() is idempotent).
+    user_risk_score = min(5.0, content_risk_score)
+
+    return user_risk_score
+
+
 # Assignment 2.1
+# Cache of case-insensitive whole-word/whole-phrase patterns, one per term in
+# the moderation lists. The lists come from censorship.dat and never change at
+# runtime, so each pattern is compiled once per process (the feed runs this
+# function for every post and comment on every render).
+_CONTENT_PATTERNS = {}
+
+# URL pattern is fixed like the term lists: compiled once per process
+# instead of on every moderate_content() call.
+_URL_PATTERN = re.compile(r'(?:https?://|www\.)\S+', re.IGNORECASE)
+
+
+def _content_pattern(term):
+    """Compile (and memoize) a case-insensitive whole-match pattern for a term."""
+    pattern = _CONTENT_PATTERNS.get(term)
+    if pattern is None:
+        pattern = re.compile(
+            r'(?<!\w)' + re.escape(term) + r'(?!\w)',
+            re.IGNORECASE,
+        )
+        _CONTENT_PATTERNS[term] = pattern
+    return pattern
+
+
 def moderate_content(content):
     """
     Args
@@ -1226,9 +1634,55 @@ def moderate_content(content):
     Then, navigate to the /admin endpoint. (http://localhost:8080/admin)
     """
 
+    # Normalization: callers may pass an empty profile, None, or non-text types.
+    content = content if isinstance(content, str) else ''
     moderated_content = content
-    score = 0
-    
+
+    # -- Tier 1: severe violations -> whole-word, case-insensitive search.
+    #    Short-circuit: replace the whole content, score fixed at 5.0.
+    for word in TIER1_WORDS:
+        if _content_pattern(word).search(content):
+            return '[content removed due to severe violation]', 5.0
+
+    # -- Tier 2: spam/scam phrases -> whole-phrase, case-insensitive search.
+    #    Only evaluated when Tier 1 found nothing (sequential checks).
+    for phrase in TIER2_PHRASES:
+        if _content_pattern(phrase).search(content):
+            return '[content removed due to spam/scam policy]', 5.0
+
+    # -- Incremental rules: score starts from 0.0, text is edited in place.
+    score = 0.0
+
+    # Tier 3: mild profanity -> one asterisk per character of each match,
+    # +2.0 per occurrence.
+    for word in TIER3_WORDS:
+        pattern = _content_pattern(word)
+        matches = pattern.findall(content)
+        if matches:
+            score += 2.0 * len(matches)
+            moderated_content = pattern.sub(
+                lambda m: '*' * len(m.group(0)), moderated_content
+            )
+
+    # URL: every link (http(s):// or bare www.), up to the next whitespace,
+    # is replaced by [link removed] and adds +2.0.
+    url_matches = _URL_PATTERN.findall(content)
+    if url_matches:
+        score += 2.0 * len(url_matches)
+        moderated_content = _URL_PATTERN.sub('[link removed]', moderated_content)
+
+    # Shouting: more than 15 alphabetic characters and more than 70% of them
+    # uppercase, +0.5 — the text itself is NOT modified for this violation.
+    # Measured against the original content so the earlier asterisk/URL
+    # substitutions cannot skew the ratio.
+    alpha_chars = [c for c in content if c.isalpha()]
+    if len(alpha_chars) > 15:
+        upper_ratio = (
+            sum(1 for c in alpha_chars if c.isupper()) / len(alpha_chars)
+        )
+        if upper_ratio > 0.7:
+            score += 0.5
+
     return moderated_content, score
 
 # Coding Assignment #3

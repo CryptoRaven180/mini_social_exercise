@@ -50,6 +50,17 @@ python var/smoke_test_tier.py
 
 Manual testing tips: thresholds refer to the current calendar month, so to see a badge quickly, add ~50 comments and ~100 reactions as a test user during the current month, or adjust `MONTHLY_TIERS` in `app.py` for local trials.
 
+## Implementation D — Admin strikes & temporary suspension
+
+An admin can send a **strike** on a post from the Admin dashboard (Posts tab,
+"⚡ Invia Strike"): the post content is replaced with
+`[content removed due to severe violation]` and a strike row is recorded against
+the author. The author sees a one-time banner on their next feed visit. Three
+strikes within a rolling 30-day window temporarily lock the login.
+Key pieces: `strikes` table (migrated by `init_db_schema()`),
+`POST /admin/posts/<post_id>/strike`, suspension check in `login()`,
+`get_strike_notifications()`.
+
 ## Usage (for students)
 
 1. Create a [fork](https://docs.github.com/en/pull-requests/collaborating-with-pull-requests/working-with-forks/fork-a-repo) of this repository
