@@ -35,6 +35,34 @@
             </div>
           {% endif %}
 
+          {% if session.user_id and session.user_id == user.id %}
+          <!-- Implementation G: invite code generator (own profile only) -->
+          <div class="card p-3 bg-light mt-3">
+            <h6 class="mb-2">🎟️ Invite a friend</h6>
+            <form action="{{ url_for('generate_invite_code') }}" method="POST" class="d-inline ms-0 mb-2">
+              <button type="submit" class="btn btn-primary btn-sm">
+                {% if user.invite_code %}Regenerate Invite Code{% else %}Generate Invite Code{% endif %}
+              </button>
+            </form>
+            {% if user.invite_code %}
+            <div class="input-group">
+              <input type="text" class="form-control" id="inviteCodeField" value="{{ user.invite_code }}" readonly>
+              <button class="btn btn-outline-secondary" type="button"
+                      onclick="copyInviteCode()">Copy</button>
+              <small class="text-muted w-100 mt-1">Regenerating the code voids the previous one.</small>
+            </div>
+            {% endif %}
+          </div>
+          <script>
+            function copyInviteCode() {
+              var field = document.getElementById('inviteCodeField');
+              field.select();
+              document.execCommand('copy');
+              field.setSelectionRange(0, 0); // mobile friendly
+            }
+          </script>
+          {% endif %}
+
           <div class="mt-4 d-flex">
             <div class="me-4">
               <a href="/u/{{ user.username }}/followers" class="text-decoration-none text-dark">

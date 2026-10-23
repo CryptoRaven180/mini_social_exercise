@@ -3,6 +3,7 @@ from werkzeug.security import generate_password_hash, check_password_hash
 from cryptography.fernet import Fernet
 import collections
 import json
+import secrets
 import sqlite3
 import hashlib
 import re
@@ -89,6 +90,86 @@ REACTION_EMOJIS = {
     'wow': '😮', 'sad': '😢', 'angry': '😠',
 }
 REACTION_TYPES = list(REACTION_EMOJIS.keys())
+
+# Implementation F: onboarding quiz seed. Tuple format:
+# (question_text, options_json, correct_option, explanation) where
+# correct_option is the 0-based index of the right answer in options_json.
+# Questions are based on the community rules (templates/rules.html.j2) and
+# on the community values, in simple English.
+QUIZ_QUESTIONS_SEED = [
+    ('What should you do if someone writes an opinion that is different from yours?',
+     '["Reply with insults", "Respect their opinion and discuss politely",'
+     ' "Report their account to delete it", "Post the same angry comment on their profile"]',
+     1,
+     'Different opinions are welcome in a healthy community. Insults are'
+     ' violations of our rules and can lead to strikes.'),
+    ('You find a post that says "Click here to earn free money!". What is the right thing to do?',
+     '["Share it with all your followers", "Ignore it completely",'
+     ' "Report the post to the moderators", "Ask how the trick works"]',
+     2,
+     'This kind of content is a scam. Reporting it helps the moderators'
+     ' keep the community safe.'),
+    ('Which of these behaviors is NEVER allowed in our community?',
+     '["Sharing posts about your hobby", "Posting scams or severely offensive content",'
+     ' "Replying politely to a question", "Following other users"]',
+     1,
+     'Scam content and severe violations are removed immediately by the'
+     ' moderation system.'),
+    ('Posting links to external websites in your comments is...',
+     '["Always required", "Not useful: links are replaced with [link removed]",'
+     ' "The best way to get followers", "A way to earn points"]',
+     1,
+     'External links are removed by the moderation function and they'
+     ' increase your risk score.'),
+    ("A friend's post was removed for a severe violation. What should they do next?",
+     '["Post the same content again many times", "Write it in capital letters",'
+     ' "Read the rules and post respectful content", "Complain in other people\'s posts"]',
+     2,
+     'Severe violations cannot be reposted. The right move is to re-read'
+     ' the rules and be respectful.'),
+    ('Writing a comment in ALL CAPITAL LETTERS to "shout" at other people is...',
+     '["Not allowed: it is measured as shouting and increases your risk score",'
+     ' "A nice way to greet new users", "Recommended for important topics",'
+     ' "Invisible to the moderation system"]',
+     0,
+     'Excessive capitalization is punished with a small score increase.'),
+    ('Someone insults you in the comments. What is the best reaction?',
+     '["Insult them back immediately", "Delete their account yourself",'
+     ' "Do not insult back: report the comment to the moderators",'
+     ' "Insult their friends instead"]',
+     2,
+     'Do not answer insult with insult. Report the comment: the moderators'
+     ' will take care of it.'),
+    ('What happens if a user receives three strikes within 30 days?',
+     '["Nothing happens", "They get a prize",'
+     ' "Their account is temporarily suspended", "They become an administrator"]',
+     2,
+     'Three strikes in a rolling 30-day window lock the login temporarily.'),
+    ('What kind of content is welcome in this community?',
+     '["Spam messages posted in every feed", "Helpful, honest and respectful posts and comments",'
+     ' "Fake news and scam offers", "Personal insults about other users"]',
+     1,
+     'The community is built on helpful and respectful contributions.'),
+    ('Mild bad words in a post are handled how?',
+     '["They are hidden with asterisks and count as a small violation",'
+     ' "Nothing happens", "Your account is deleted immediately",'
+     ' "They are translated into another language"]',
+     0,
+     'Mild bad words are replaced by asterisks and add to the content'
+     ' score.'),
+    ('You are not sure whether a post breaks the rules. What should you do?',
+     '["Copy and repeat the same content", "Report it to the moderators and let them decide",'
+     ' "Share it everywhere before checking", "Reply with insults to be safe"]',
+     1,
+     'When in doubt, let the moderators decide. Reporting is always the'
+     ' safe choice.'),
+    ('Another user invites everybody to a "contest" where you must send money to win a prize. This is...',
+     '["A fun community activity", "Almost certainly a scam: it must be reported",'
+     ' "A good way to make new friends", "Allowed if the prize is big"]',
+     1,
+     'Any activity that asks for money or personal data is a scam pattern'
+     ' and violates the rules.'),
+]
 
 
 def init_db_schema():
@@ -185,6 +266,67 @@ def init_db_schema():
             db.execute(
                 'CREATE INDEX IF NOT EXISTS idx_posts_user_id'
                 ' ON posts(user_id)'
+            )
+
+            # Speeds up the "which authors does user X follow" lookups used
+            # by the recommendation score (the follows table has no PK).
+            db.execute(
+                'CREATE INDEX IF NOT EXISTS idx_follows_follower'
+                ' ON follows(follower_id, followed_id)'
+            )
+
+            # --- Implementation F: onboarding quiz -------------------------
+            cursor = db.execute('PRAGMA table_info(users)')
+            columns = [column[1] for column in cursor.fetchall()]
+            if 'has_completed_quiz' not in columns:
+                db.execute(
+                    'ALTER TABLE users ADD COLUMN has_completed_quiz'
+                    ' INTEGER DEFAULT 0'
+                )
+
+            db.execute(
+                '''
+                CREATE TABLE IF NOT EXISTS quiz_questions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    question_text TEXT NOT NULL,
+                    options_json TEXT NOT NULL,
+                    correct_option INTEGER NOT NULL,
+                    explanation TEXT NOT NULL
+                )
+                '''
+            )
+
+            # Seed: run only once, when the table is still empty
+            seeded = db.execute(
+                'SELECT COUNT(*) as cnt FROM quiz_questions'
+            ).fetchone()
+            if seeded and seeded['cnt'] == 0:
+                db.executemany(
+                    'INSERT INTO quiz_questions (question_text,'
+                    ' options_json, correct_option, explanation)'
+                    ' VALUES (?, ?, ?, ?)',
+                    QUIZ_QUESTIONS_SEED,
+                )
+
+            # --- Implementation G: invite codes and friendship badge ------
+            cursor = db.execute('PRAGMA table_info(users)')
+            columns = [column[1] for column in cursor.fetchall()]
+            if 'invite_code' not in columns:
+                db.execute('ALTER TABLE users ADD COLUMN invite_code TEXT')
+            if 'invited_by' not in columns:
+                db.execute('ALTER TABLE users ADD COLUMN invited_by INTEGER')
+            if 'invited_at' not in columns:
+                db.execute('ALTER TABLE users ADD COLUMN invited_at TIMESTAMP')
+            # ALTER TABLE cannot add a UNIQUE column, so the code uniqueness
+            # is enforced by an index (multiple NULLs are fine, they mean
+            # "no code generated yet").
+            db.execute(
+                'CREATE UNIQUE INDEX IF NOT EXISTS idx_users_invite_code'
+                ' ON users(invite_code)'
+            )
+            db.execute(
+                'CREATE INDEX IF NOT EXISTS idx_users_invited_by'
+                ' ON users(invited_by)'
             )
             
             unscored_posts = db.execute(
@@ -302,7 +444,63 @@ def get_badges_for_users(user_ids):
             comments_by_user.get(user_id, 0), reactions_by_user.get(user_id, 0)
         )
         badges[user_id] = badge
+
+    # Implementation G: add the friendship badge (🤝) to the tier badge of
+    # every user who brought a new member this month (e.g. "🥇🤝").
+    friendship = get_friendship_badges(user_ids)
+    for user_id, friend_badge in friendship.items():
+        badges[user_id] = badges.get(user_id, '') + friend_badge
+
     return badges
+
+
+# Implementation G: emoji shown to users who brought a new member with
+# their invite code during the current calendar month.
+FRIENDSHIP_BADGE = '🤝'
+# Alphabet without the visually ambiguous characters (I, O, 0, 1).
+INVITE_CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'
+INVITE_CODE_LENGTH = 6
+
+
+def get_friendship_badges(user_ids):
+    """Implementation G: batched friendship badge.
+
+    A user shows 🤝 when at least one account registered with their invite
+    code during the CURRENT calendar month. Like the silver/gold tiers the
+    badge is computed dynamically on the month window, so it resets
+    automatically at the end of the month and needs no reset job.
+
+    Returns:
+        A dict mapping user_id to FRIENDSHIP_BADGE for the users that
+        currently merit it (empty dict otherwise).
+    """
+    if not user_ids:
+        return {}
+
+    month_start = datetime.utcnow().strftime('%Y-%m') + '-01 00:00:00'
+    placeholders = ', '.join('?' * len(user_ids))
+    rows = query_db(
+        f'SELECT invited_by FROM users'
+        f' WHERE invited_by IN ({placeholders}) AND invited_at >= ?',
+        tuple(user_ids) + (month_start,),
+    ) or []
+    if not rows:
+        return {}
+    return {row['invited_by']: FRIENDSHIP_BADGE for row in rows}
+
+
+def _generate_invite_code():
+    """Generates a unique invite code ("INVITE-XXXXXX"), retrying on the
+    (astronomically unlikely) collision with an existing one."""
+    while True:
+        code = 'INVITE-' + ''.join(
+            secrets.choice(INVITE_CODE_ALPHABET)
+            for _ in range(INVITE_CODE_LENGTH)
+        )
+        if not query_db(
+                'SELECT id FROM users WHERE invite_code = ?',
+                (code,), one=True):
+            return code
 
 
 def get_previous_month_summary(user_id):
@@ -527,7 +725,12 @@ def get_suspension(user_id, username=None):
 
 @app.route('/')
 def feed():
-    #  1. Get Pagination and Filter Parameters 
+    # Implementation F: freshly registered users (session flag set at
+    # signup) are routed to the onboarding quiz until they pass it.
+    if session.get('quiz_required'):
+        return redirect(url_for('take_quiz'))
+
+    #  1. Get Pagination and Filter Parameters
     try:
         page = int(request.args.get('page', 1))
     except ValueError:
@@ -772,9 +975,11 @@ def user_profile(username):
 
     user = dict(user_raw)
 
-    # Monthly participation tier (Implementation A), shown on the profile too
+    # Monthly participation tier (Implementation A) + friendship badge
+    # (Implementation G), both computed dynamically on the current month
     badge_emoji, level_name, _, _ = get_user_badge(user['id'])
-    user['badge'] = badge_emoji
+    friend_badge = get_friendship_badges([user['id']]).get(user['id'], '')
+    user['badge'] = badge_emoji + friend_badge
     user['level_name'] = level_name
 
     moderated_bio, _ = moderate_content(user.get('profile', ''))
@@ -920,6 +1125,22 @@ def signup():
         birthdate = request.form.get('birthdate', '')
         profile = request.form.get('profile', '')
 
+        # Implementation G: optional invite code. It is validated BEFORE
+        # any user row is created: an invalid or already-used code blocks
+        # the registration ("Codice amico non valido"), while leaving the
+        # field empty simply registers without a sponsor.
+        invite_code = (request.form.get('invite_code') or '').strip()
+        sponsor_id = None
+        if invite_code:
+            sponsor = query_db(
+                'SELECT id FROM users WHERE invite_code = ?',
+                (invite_code,), one=True
+            )
+            if sponsor is None:
+                flash('Codice amico non valido.', 'danger')
+                return render_template('signup.html.j2')
+            sponsor_id = sponsor['id']
+
         hashed_password = generate_password_hash(password)
 
         db = get_db()
@@ -929,19 +1150,33 @@ def signup():
                 'INSERT INTO users (username, password, location, birthdate, profile) VALUES (?, ?, ?, ?, ?)',
                 (username, hashed_password, location, birthdate, profile)
             )
-            db.commit()
 
             # 1. Get the ID of the user we just created.
             new_user_id = cur.lastrowid
+
+            # Implementation G: record the sponsor of the new member, so
+            # the friendship badge can be awarded to them this month.
+            if sponsor_id:
+                cur.execute(
+                    'UPDATE users SET invited_by = ?,'
+                    ' invited_at = CURRENT_TIMESTAMP WHERE id = ?',
+                    (sponsor_id, new_user_id)
+                )
+
+            db.commit()
 
             # 2. Add user info to the session cookie.
             session.clear() # Clear any old session data
             session['user_id'] = new_user_id
             session['username'] = username
 
-            # 3. Flash a welcome message and redirect to the feed.
+            # 3. Flash a welcome message and send the NEW user to the
+            #    onboarding quiz (Implementation F). The session flag only
+            #    exists for freshly registered accounts, so pre-existing
+            #    users are never gated.
+            session['quiz_required'] = True
             flash(f'Welcome, {username}! Your account has been created.', 'success')
-            return redirect(url_for('feed')) # Redirect to the main feed/dashboard
+            return redirect(url_for('take_quiz'))
 
         except sqlite3.IntegrityError:
             flash('Username already taken. Please choose another one.', 'danger')
@@ -950,6 +1185,98 @@ def signup():
             db.close()
             
     return render_template('signup.html.j2')
+
+
+# Implementation F: onboarding quiz for newly registered users.
+QUIZ_QUESTION_COUNT = 3
+
+
+def _pick_quiz_questions(count=QUIZ_QUESTION_COUNT):
+    """Picks N random quiz questions and decodes the options JSON."""
+    rows = query_db(
+        'SELECT * FROM quiz_questions ORDER BY RANDOM() LIMIT ?',
+        (count,)
+    ) or []
+    questions = []
+    for row in rows:
+        question = dict(row)
+        question['options'] = json.loads(question['options_json'])
+        questions.append(question)
+    return questions
+
+
+def _new_quiz_round():
+    """Draws a new random quiz round and records its ids in the session.
+
+    The ids recorded here are the ONLY ones the next POST will grade, so a
+    forged form cannot grade questions the user was never shown."""
+    questions = _pick_quiz_questions()
+    session['quiz_question_ids'] = [q['id'] for q in questions]
+    return questions
+
+
+@app.route('/quiz', methods=['GET', 'POST'])
+def take_quiz():
+    """Onboarding quiz shown to freshly registered users (Implementation F).
+
+    A wrong answer shows the educational explanation stored for that
+    question and offers a brand new random round; all answers correct sets
+    has_completed_quiz on the user and releases them to the feed."""
+    user_id = session.get('user_id')
+    if not user_id:
+        return redirect(url_for('login'))
+
+    if request.method == 'POST':
+        # Grade only the questions that were actually displayed
+        question_ids = session.pop('quiz_question_ids', [])
+        if not question_ids:
+            # No round was displayed (e.g. direct POST): start a new one
+            return render_template('quiz.html.j2',
+                                   questions=_new_quiz_round(), wrong=[])
+
+        rows = query_db(
+            'SELECT * FROM quiz_questions WHERE id IN (%s)'
+            % ', '.join('?' * len(question_ids)),
+            question_ids,
+        ) or []
+        questions_by_id = {row['id']: row for row in rows}
+
+        wrong = []
+        for question_id in question_ids:
+            question_raw = questions_by_id.get(question_id)
+            if not question_raw:
+                continue
+            # .get(..., type=int) yields None for missing/tampered values
+            answer = request.form.get(f'answer_{question_id}', type=int)
+            if answer is None or answer != question_raw['correct_option']:
+                question = dict(question_raw)
+                question['options'] = json.loads(question['options_json'])
+                question['user_answer'] = (
+                    question['options'][answer]
+                    if answer is not None
+                    and 0 <= answer < len(question['options'])
+                    else None
+                )
+                wrong.append(question)
+
+        if not wrong and rows:
+            # Quiz passed: persist the flag on the user and release them
+            query_db(
+                'UPDATE users SET has_completed_quiz = 1 WHERE id = ?',
+                (user_id,),
+                commit=True,
+            )
+            session.pop('quiz_required', None)
+            flash('Quiz completed! Welcome to the community.', 'success')
+            return redirect(url_for('feed'))
+
+        # At least one wrong answer: show the explanations and a new round
+        return render_template('quiz.html.j2',
+                               questions=_new_quiz_round(), wrong=wrong)
+    else:
+        questions = _new_quiz_round()
+        return render_template('quiz.html.j2', questions=questions, wrong=[])
+
 
 @app.route('/login', methods=['GET', 'POST'])
 def login():
@@ -989,6 +1316,29 @@ def logout():
     session.clear()
     flash('Logged out.', 'info')
     return redirect(url_for('login'))
+
+
+@app.route('/invite/generate', methods=['POST'])
+def generate_invite_code():
+    """Implementation G: creates (or regenerates) the user's invite code.
+
+    Regenerating overwrites the previous code, which therefore stops being
+    usable. The new code is returned in a read-only field on the profile."""
+    user_id = session.get('user_id')
+    if not user_id:
+        flash('You must be logged in to generate an invite code.', 'danger')
+        return redirect(url_for('login'))
+
+    code = _generate_invite_code()
+    query_db('UPDATE users SET invite_code = ? WHERE id = ?',
+             (code, user_id), commit=True)
+
+    user = query_db('SELECT username FROM users WHERE id = ?',
+                    (user_id,), one=True)
+    username = user['username'] if user else session.get('username')
+    flash('Invite code generated! Copy it and share it with a friend.'
+          ' Generating a new one voids the previous code.', 'success')
+    return redirect(url_for('user_profile', username=username))
 
 @app.route('/posts/<int:post_id>/comment', methods=['POST'])
 def add_comment(post_id):
@@ -1686,30 +2036,136 @@ def moderate_content(content):
     return moderated_content, score
 
 # Coding Assignment #3
-# Assignment 3.1
+
+# Recency window used for the interaction bonus: an interaction (a positive
+# reaction or a comment on one of the author's posts) only counts when it
+# happened within this many days.
+INTERACTION_WINDOW_DAYS = 10
+
+# How many recent posts are considered as candidates, and how many of them
+# are actually shown on the Recommended tab.
+RECENT_CANDIDATES = 30
+RECOMMENDED_POSTS = 5
+
+
 def recommend(user_id, filter_following):
     """
+    Recommendation algorithm: takes the 30 most recent recommendable posts
+    and shows the 5 with the highest score.
+
     Args:
-        user_id: The ID of the current user.
+        user_id: The ID of the current user (or None when logged out).
         filter_following: Boolean, True if we only want to see recommendations from followed users.
 
     Returns:
         A list of 5 recommended posts, in reverse-chronological order.
 
+    Scoring (per candidate post, on its author):
+      +50 the user FOLLOWS the author;
+      +30 the author is NOT followed, but the user reacted POSITIVELY
+          (like/love/laugh/wow/haha, i.e. anything except 'sad'/'angry')
+          to one of the author's posts within INTERACTION_WINDOW_DAYS;
+      +30 the author is NOT followed, but the user COMMENTED on one of the
+          author's posts within INTERACTION_WINDOW_DAYS;
+      the two +30 bonuses add up (positive reaction AND comment -> +60).
+
+    Candidate pool: the 30 most recent posts excluding the user's own posts
+    and the posts the user already reacted to. Nothing older is ever
+    considered, and no other post can be recalled beyond these 30.
+
+    Logged out users have no interactions, so all scores are 0 and the tab
+    simply shows the most recent posts.
+
     To test whether your recommendation algorithm works, let's pretend we like the DIY topic. Here are some users that often post DIY comment and a few example posts. Make sure your account did not engage with anything else. You should test your algorithm with these and see if your recommendation algorithm picks up on your interest in DIY and starts showing related content.
-    
+
     Users: @starboy99, @DancingDolphin, @blogger_bob
     Posts: 1810, 1875, 1880, 2113
-    
-    Materials: 
+
+    Materials:
     - https://www.nvidia.com/en-us/glossary/recommendation-system/
     - http://www.configworks.com/mz/handout_recsys_sac2010.pdf
     - https://www.researchgate.net/publication/227268858_Recommender_Systems_Handbook
     """
+    # Logged out: no personalization is possible, every author scores 0 and
+    # the tie-break simply returns the 5 most recent posts.
+    if not user_id:
+        return query_db(
+            '''SELECT p.id, p.content, p.created_at, p.is_pinned,
+                      p.is_daily_prompt, u.username, u.id as user_id
+               FROM posts p JOIN users u ON p.user_id = u.id
+               ORDER BY p.created_at DESC LIMIT ?''',
+            (RECOMMENDED_POSTS,)
+        ) or []
 
-    recommended_posts = {} 
+    # The 30 most recent recommendable posts: not the user's own posts, not
+    # the posts the user already reacted to, optionally only from followed
+    # authors ("Following" filter).
+    following_clause = ""
+    following_param = []
+    if filter_following:
+        following_clause = ("AND p.user_id IN"
+                            " (SELECT followed_id FROM follows"
+                            " WHERE follower_id = ?)")
+        following_param = [user_id]
 
-    return recommended_posts;
+    query = f"""
+        WITH recent AS (
+            SELECT p.*,
+                   -- Does the user follow this author?
+                   EXISTS (SELECT 1 FROM follows f
+                           WHERE f.follower_id = ?
+                             AND f.followed_id = p.user_id) AS author_followed,
+                   -- Positive reaction on one of the author's posts, recent?
+                   EXISTS (SELECT 1 FROM reactions rx
+                           JOIN posts rp ON rp.id = rx.post_id
+                           WHERE rx.user_id = ?
+                             AND rp.user_id = p.user_id
+                             AND rx.reaction_type NOT IN ('sad', 'angry')
+                             AND rx.created_at >=
+                                 datetime('now',
+                                          '-{int(INTERACTION_WINDOW_DAYS)} days'))
+                       AS reacted_positively,
+                   -- Comment on one of the author's posts, recent?
+                   EXISTS (SELECT 1 FROM comments cm
+                           JOIN posts cp ON cp.id = cm.post_id
+                           WHERE cm.user_id = ?
+                             AND cp.user_id = p.user_id
+                             AND cm.created_at >=
+                                 datetime('now',
+                                          '-{int(INTERACTION_WINDOW_DAYS)} days'))
+                       AS commented
+            FROM posts p
+            WHERE p.user_id != ?
+              AND p.id NOT IN
+                  (SELECT post_id FROM reactions WHERE user_id = ?)
+              {following_clause}
+            ORDER BY p.created_at DESC
+            LIMIT {RECENT_CANDIDATES}
+        )
+        SELECT rec.id, rec.content, rec.created_at, rec.is_pinned,
+               rec.is_daily_prompt, u.username, u.id AS user_id,
+               (CASE WHEN rec.author_followed THEN 50.0
+                     ELSE 30.0 * rec.reacted_positively
+                          + 30.0 * rec.commented
+                END) AS score
+        FROM recent rec
+        JOIN users u ON u.id = rec.user_id
+        ORDER BY score DESC, rec.created_at DESC
+        LIMIT ?
+    """
+
+    query_params = [
+        user_id,  # author_followed (follows check)
+        user_id,  # reacted_positively (user's recent positive reactions)
+        user_id,  # commented (user's recent comments)
+        user_id,  # exclude the user's own posts
+        user_id,  # exclude the posts the user already reacted to
+    ] + following_param + [RECOMMENDED_POSTS]
+
+    candidates = query_db(query, query_params) or []
+
+    # The 5 best-scoring posts, displayed in reverse-chronological order
+    return sorted(candidates, key=lambda p: p['created_at'], reverse=True)
 
 if __name__ == '__main__':
     # One-time (idempotent) migration for the tier system and daily prompt

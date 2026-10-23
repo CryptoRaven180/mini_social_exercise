@@ -258,6 +258,9 @@
   {% endfor %}
 </div>
 
+  <!-- Pagination is not shown on the Recommended tab: that tab always
+       shows exactly the 5 recommended posts (page 1). -->
+  {% if current_sort != 'recommended' %}
   <div class="d-flex justify-content-center align-items-center my-4">
     <a href="{{ url_for('feed', page=page-1, sort=current_sort, show=current_show) }}"
       class="btn btn-primary {% if page <= 1 %}btn-light disabled{% endif %}">
@@ -269,4 +272,5 @@
       Next &raquo;
     </a>
   </div>
+  {% endif %}
 {% endblock %}
